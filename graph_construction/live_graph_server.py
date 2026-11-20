@@ -19,6 +19,7 @@ automatically from the path passed to --trajs.
 
 import argparse
 import logging
+import os
 import sys
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -85,6 +86,12 @@ Examples
         "--assets_dir", default=None,
         help="Directory containing graph_template.html, styles.css, and graph_renderer.js. "
              "Defaults to the directory containing this script.",
+    )
+    p.add_argument(
+        "--upload_dir", default=os.environ.get("GRAPHECTORY_UPLOAD_DIR") or None,
+        help="Folder where POST /api/upload stores ATIF trajectories sent by other machines "
+             "(created if missing). Uploads are disabled when omitted. "
+             "Defaults to $GRAPHECTORY_UPLOAD_DIR.",
     )
     p.add_argument("--port", type=int, default=8000)
     return p.parse_args()
@@ -175,12 +182,22 @@ def main() -> int:
                 logger.error("--eval_report path does not exist: %s", eval_report)
                 return 1
 
+    upload_dir: Path | None = None
+    if args.upload_dir:
+        upload_dir = Path(args.upload_dir).expanduser()
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error("--upload_dir could not be created: %s (%s)", upload_dir, exc)
+            return 1
+
     # Inject configuration into the handler class before the server starts.
     GraphHandler.graphs_dir       = trajs
     GraphHandler.agent_type       = agent_type
     GraphHandler.eval_report_path = str(eval_report) if eval_report else None
     GraphHandler.cmd_parser       = _setup_cmd_parser()
     GraphHandler.assets_dir       = assets_dir
+    GraphHandler.upload_dir       = upload_dir
 
     # ThreadingHTTPServer handles each request in its own thread, so slow
     # graph builds never block the browser UI or subsequent requests.
@@ -206,7 +223,9 @@ def main() -> int:
     else:
         print( "  Data source: not set — configure via the browser UI")
     print(f"  Assets     : {assets_dir.absolute()}")
-    print(f"  URL        : http://localhost:{args.port}")
+    if upload_dir:
+        print(f"  Uploads    : {upload_dir.absolute()}  (POST /api/upload)")
+    print(f"  URL      : http://localhost:{args.port}")
     print(f"{'─' * 60}\n")
     print("  Press Ctrl+C to stop.\n")
 

@@ -66,7 +66,26 @@ Then run the server inside the container.
 | `--trajs` | ✓ | — | Supported trajectory directory or JSONL file. Compatible Claude Code sessions use a session root; Codex accepts `~/.codex/sessions` or one rollout JSONL file. |
 | `--eval_report` | | — | Optional SWE-bench evaluation report JSON containing `"resolved_ids"` and `"unresolved_ids"` arrays. |
 | `--assets_dir` | | script directory | Directory containing `graph_template.html`, `styles.css`, and `graph_renderer.js`. Only needed if you have moved those files elsewhere. |
+| `--upload_dir` | | `$GRAPHECTORY_UPLOAD_DIR`, else off | Folder where `POST /api/upload` stores ATIF trajectories sent by other machines (created if missing). Uploads are refused when it is not set. |
 | `--port` | | `8000` | Port to serve on. |
+
+#### Receiving trajectories from another machine
+
+Started with `--upload_dir <folder>`, the server accepts one ATIF trajectory per
+request:
+
+```bash
+curl -X POST http://<server>:8000/api/upload \
+  -H "Content-Type: application/json" \
+  -d '{"run_id": "my-run", "instance_id": "task-1", "trajectory": { ...ATIF document... }}'
+```
+
+It writes `<folder>/<run_id>/<instance_id>/trajectory.json`, replacing an earlier
+upload of the same pair, and switches the viewer to the upload folder so the
+trajectory appears in the list. `run_id` and `instance_id` must match
+`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`; a request is limited to 64 MB. The folder
+must be writable by the server's user: in Docker, the image runs as UID 10001,
+so a mounted host folder needs that user to have write access.
 
 ### The Browser UI
 

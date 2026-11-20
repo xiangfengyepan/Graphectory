@@ -21,11 +21,13 @@ GET  /api/sankey                → aggregated phase-per-step data for Sankey di
 GET  /api/config                → currently active trajs path and eval_report path
 GET  /api/select-path           → local native file or folder picker
 POST /api/config                → swap trajs/eval_report live; validates paths and overlap
+POST /api/upload                → store one ATIF trajectory in the upload folder (opt-in)
 """
 
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -74,6 +76,13 @@ _CLIENT_DISCONNECT_ERRORS = (
 )
 
 _PATH_PICKER_LOCK = threading.Lock()
+
+# POST /api/upload: one ATIF trajectory per request, written under the
+# server's upload folder as <run_id>/<instance_id>/trajectory.json.
+_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+_UPLOAD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_UPLOAD_FILE_NAME = "trajectory.json"
+_UPLOAD_LOCK = threading.Lock()
 _LOCALHOST_ADDRESSES = {"127.0.0.1", "::1"}
 
 
@@ -86,6 +95,7 @@ class GraphHandler(BaseHTTPRequestHandler):
     eval_report_path: str  = None
     cmd_parser             = None
     assets_dir:       Path = None   # directory containing graph_template.html etc.
+    upload_dir:       Path = None   # where POST /api/upload writes; None disables uploads
 
     # ── In-memory caches (class-level, shared across all handler instances) ──
     _cache_lock:   threading.RLock  = threading.RLock()
@@ -182,24 +192,13 @@ class GraphHandler(BaseHTTPRequestHandler):
 
         try:
             if path == "/api/config":
-                # Block cross-site requests: a foreign page can only send a
-                # "simple" (text/plain, form) POST without a CORS preflight,
-                # and a browser-supplied Origin must match the Host it targets.
-                content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if content_type != "application/json":
-                    self._error(415, "Content-Type must be application/json.")
-                    return
-                # Reverse proxies (e.g. tailscale serve) may rewrite Host and
-                # pass the browser-facing one in X-Forwarded-Host.
-                origin = self.headers.get("Origin")
-                allowed_hosts = {self.headers.get("Host"), self.headers.get("X-Forwarded-Host")}
-                if origin and urlparse(origin).netloc not in allowed_hosts:
-                    self._error(403, "Cross-origin requests are not allowed.")
-                    return
-                length = int(self.headers.get("Content-Length", 0))
-                body   = self.rfile.read(length)
-                data   = json.loads(body)
-                self._api_post_config(data)
+                data = self._read_json_post()
+                if data is not None:
+                    self._api_post_config(data)
+            elif path == "/api/upload":
+                data = self._read_json_post(max_bytes=_MAX_UPLOAD_BYTES)
+                if data is not None:
+                    self._api_post_upload(data)
             else:
                 self._error(404, "Not found")
 
@@ -208,6 +207,46 @@ class GraphHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception("[handler] Unhandled error for POST %s", self.path)
             self._error(500, str(exc))
+
+    def _read_json_post(self, max_bytes: Optional[int] = None) -> Optional[dict]:
+        """Read a same-origin JSON object from a POST body.
+
+        Returns the object, or ``None`` after answering with an error.
+        """
+        # Block cross-site requests: a foreign page can only send a
+        # "simple" (text/plain, form) POST without a CORS preflight,
+        # and a browser-supplied Origin must match the Host it targets.
+        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            self._error(415, "Content-Type must be application/json.")
+            return None
+        # Reverse proxies (e.g. tailscale serve) may rewrite Host and
+        # pass the browser-facing one in X-Forwarded-Host.
+        origin = self.headers.get("Origin")
+        allowed_hosts = {self.headers.get("Host"), self.headers.get("X-Forwarded-Host")}
+        if origin and urlparse(origin).netloc not in allowed_hosts:
+            self._error(403, "Cross-origin requests are not allowed.")
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._error(400, "Invalid Content-Length.")
+            return None
+        if length < 0:
+            self._error(400, "Invalid Content-Length.")
+            return None
+        if max_bytes is not None and length > max_bytes:
+            self._error(413, f"Request body is larger than {max_bytes} bytes.")
+            return None
+        try:
+            data = json.loads(self.rfile.read(length))
+        except ValueError:
+            self._error(400, "Request body must be JSON.")
+            return None
+        if not isinstance(data, dict):
+            self._error(400, "Request body must be a JSON object.")
+            return None
+        return data
 
     # ── Route handlers ────────────────────────────────────────────────────────
 
@@ -297,11 +336,23 @@ class GraphHandler(BaseHTTPRequestHandler):
                 return
 
         # ── Apply ─────────────────────────────────────────────────────────────
+        self._apply_data_source(trajs, agent_type, report)
+
+        self._respond_json({
+            "ok":          True,
+            "trajs":       str(trajs),
+            "eval_report": str(report) if report else "",
+            "agent_type":  agent_type,
+        })
+
+    @classmethod
+    def _apply_data_source(cls, trajs: Path, agent_type: str, report: Optional[Path]) -> None:
+        """Switch the active data source and flush every cache built from it."""
         logger.info(
             "[handler] Reconfiguring data source: trajs=%s  report=%s", trajs, report,
         )
         clear_trajectory_caches()
-        with self._cache_lock:
+        with cls._cache_lock:
             GraphHandler.graphs_dir       = trajs
             GraphHandler.agent_type       = agent_type
             GraphHandler.eval_report_path = str(report) if report else None
@@ -316,11 +367,72 @@ class GraphHandler(BaseHTTPRequestHandler):
             GraphHandler._graph_cache      = OrderedDict()
             GraphHandler._sankey_cache    = None
 
+    def _api_post_upload(self, data: dict):
+        """Store one uploaded ATIF trajectory and show the upload folder.
+
+        Body: ``{"run_id": str, "instance_id": str, "trajectory": {ATIF doc}}``.
+        The document is written to
+        ``<upload_dir>/<run_id>/<instance_id>/trajectory.json`` (replacing an
+        earlier upload of the same pair), then the upload folder becomes the
+        active data source so the trajectory is listed by ``/api/graphs``.
+
+        Uploads are off unless the server was started with ``--upload_dir``
+        (or ``GRAPHECTORY_UPLOAD_DIR``): a Viewer must not accept files from
+        the network by default.
+        """
+        upload_dir = self.upload_dir
+        if upload_dir is None:
+            self._error(
+                403,
+                "Uploads are disabled. Start the server with --upload_dir <folder> "
+                "(or set GRAPHECTORY_UPLOAD_DIR) to accept trajectories.",
+            )
+            return
+
+        run_id = data.get("run_id")
+        instance_id = data.get("instance_id")
+        doc = data.get("trajectory")
+        for name, value in (("run_id", run_id), ("instance_id", instance_id)):
+            if not isinstance(value, str) or not _UPLOAD_ID_RE.fullmatch(value):
+                self._error(400, f"'{name}' must match [A-Za-z0-9][A-Za-z0-9._-]{{0,127}}.")
+                return
+        if not (
+            isinstance(doc, dict)
+            and isinstance(doc.get("schema_version"), str)
+            and doc["schema_version"].upper().startswith("ATIF")
+            and isinstance(doc.get("agent"), dict)
+            and isinstance(doc.get("steps"), list)
+        ):
+            self._error(
+                400,
+                "'trajectory' must be an ATIF document (schema_version, agent, steps).",
+            )
+            return
+
+        root = Path(upload_dir).resolve()
+        target = (root / run_id / instance_id / _UPLOAD_FILE_NAME).resolve()
+        if root not in target.parents:
+            self._error(400, "Upload path escapes the upload folder.")
+            return
+        try:
+            with _UPLOAD_LOCK:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(f".{_UPLOAD_FILE_NAME}.{os.getpid()}.{threading.get_ident()}.tmp")
+                tmp.write_text(json.dumps(doc), encoding="utf-8")
+                os.replace(tmp, target)
+        except OSError as exc:
+            self._error(500, f"Could not write into the upload folder {root}: {exc}")
+            return
+
+        agent_type = detect_agent_type(root)
+        self._apply_data_source(root, agent_type, None)
+        logger.info("[handler] Stored uploaded trajectory %s", target)
         self._respond_json({
-            "ok":          True,
-            "trajs":       str(trajs),
-            "eval_report": str(report) if report else "",
-            "agent_type":  agent_type,
+            "ok":            True,
+            "trajs":         str(root),
+            "agent_type":    agent_type,
+            "trajectory_id": doc.get("trajectory_id") or "",
+            "path":          str(target.relative_to(root).as_posix()),
         })
 
     def _api_select_path(self, params: dict[str, list[str]]):
