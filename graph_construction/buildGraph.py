@@ -196,7 +196,8 @@ class GraphBuilder:
         self.previous_node = None
 
     def add_or_update_node(self, node_label, args, flags, phase, step_idx,
-                          tool=None, command=None, subcommand=None, thought_length=0, has_cd=False):
+                          tool=None, command=None, subcommand=None, thought_length=0, has_cd=False,
+                          agent=None):
         """Add a new node or update existing node with a new occurrence.
 
         Args:
@@ -210,11 +211,18 @@ class GraphBuilder:
             subcommand: Subcommand name (if applicable)
             thought_length: Length of thought text for this step
             has_cd: Whether this node had a cd command stripped
+            agent: Owning agent name (multi-agent trajectories). When given, node
+                deduplication is scoped per agent so an identical action performed
+                by two agents stays two distinct, separately-owned nodes. ``None``
+                (the default for single-agent trajectories) preserves the original
+                global deduplication behaviour unchanged.
 
         Returns:
             node_key: The key of the added or updated node
         """
-        node_signature = hash_node_signature(node_label, args, flags)
+        # Namespace the dedup signature by agent so the same action from two
+        # different agents does not collapse into one shared node.
+        node_signature = (agent, hash_node_signature(node_label, args, flags))
 
         if node_signature in self.node_signature_to_key:
             # Update existing node
@@ -241,7 +249,8 @@ class GraphBuilder:
                 tool=tool,
                 command=command,
                 subcommand=subcommand,
-                has_cd=has_cd
+                has_cd=has_cd,
+                agent=agent,
             )
             self.node_signature_to_key[node_signature] = node_key
 

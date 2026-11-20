@@ -77,6 +77,7 @@ def check_command_outcome(observation: str, tool: str = None, subcommand: str = 
 
 CLAUDE_CODE_TRAJECTORY_FORMAT = "claude-code-wire-1"
 CODEX_TRAJECTORY_FORMAT = "codex-rollout-jsonl-1"
+ATIF_TRAJECTORY_FORMAT = "atif-1"
 
 _CODEX_CALL_TYPES = {
     "function_call",
@@ -421,6 +422,185 @@ def _is_claude_code_wire_file(path: Path) -> bool:
     )
 
 
+# --- ATIF (Agent Trajectory Interchange Format, Harbor) ---------------------
+# One JSON document per trajectory (usually ``trajectory.json``): a root ``agent``
+# plus ordered ``steps``. Multi-agent (MAS) runs embed child trajectories under
+# ``subagent_trajectories`` and link to them from a step's
+# ``observation.results[].subagent_trajectory_ref``. We read ATIF and flatten it
+# (recursively inlining each subagent between boundary markers) into the same
+# Claude Code *wire* events the existing builder consumes, so a MAS run renders as
+# one super-agent graph without changing the graph model.
+
+def _read_json_doc(path: Path) -> dict | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            value = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _is_atif_file(path: Path) -> bool:
+    """Return whether *path* is an ATIF trajectory document."""
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return False
+    doc = _read_json_doc(path)
+    return (
+        doc is not None
+        and isinstance(doc.get("schema_version"), str)
+        and doc["schema_version"].upper().startswith("ATIF")
+        and isinstance(doc.get("agent"), dict)
+        and isinstance(doc.get("steps"), list)
+    )
+
+
+def _atif_files(source: Path) -> list[Path]:
+    """Find ATIF trajectory documents at or below *source*."""
+    if source.is_file():
+        return [source] if _is_atif_file(source) else []
+    return [p for p in source.rglob("*.json") if _is_atif_file(p)]
+
+
+def _atif_instance_id(path: Path, doc: dict) -> str:
+    """A stable, human-readable id for an ATIF trajectory file."""
+    # Trial-result layout is <instance>/agent/trajectory.json: prefer <instance>.
+    if path.name == "trajectory.json" and path.parent.name == "agent":
+        if path.parent.parent.name:
+            return path.parent.parent.name
+    tid = doc.get("trajectory_id")
+    if isinstance(tid, str) and tid.strip():
+        return tid
+    return path.parent.name or path.stem
+
+
+def _atif_content_text(value) -> str:
+    """Flatten an ATIF ``message``/``content`` (str or ContentPart list) to text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif ptype in ("image", "audio"):
+                src = part.get("source") if isinstance(part.get("source"), dict) else {}
+                parts.append(f"[{ptype}: {src.get('path') or ''}]")
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _atif_to_wire_records(root_doc: dict, base_dir: Path | None = None) -> list[dict]:
+    """Flatten an ATIF trajectory (with embedded/linked subagents) to wire events."""
+    records: list[dict] = []
+    counters = {"step": 0, "call": 0}
+
+    def event(payload: dict) -> None:
+        records.append({"type": "context.append_loop_event", "event": payload})
+
+    def emit(thought: str, calls: list[dict], agent: str | None = None) -> None:
+        step_uuid = f"step-{counters['step']}"
+        counters["step"] += 1
+        event({"type": "step.begin", "uuid": step_uuid, "step": counters["step"],
+               "agent": agent})
+        if thought:
+            event({"type": "content.part", "stepUuid": step_uuid,
+                   "part": {"type": "text", "text": thought}})
+        for call in calls:
+            call_id = f"call-{counters['call']}"
+            counters["call"] += 1
+            event({"type": "tool.call", "stepUuid": step_uuid, "toolCallId": call_id,
+                   "name": call["name"], "args": call.get("args") or {}})
+            result = {"output": call.get("observation", "")}
+            if call.get("is_error") is not None:
+                result["isError"] = call["is_error"]
+            event({"type": "tool.result", "toolCallId": call_id, "result": result})
+
+    def subindex(doc: dict) -> dict:
+        out: dict = {}
+        for sub in doc.get("subagent_trajectories") or []:
+            if isinstance(sub, dict) and isinstance(sub.get("trajectory_id"), str):
+                out[sub["trajectory_id"]] = sub
+        return out
+
+    def resolve_ref(ref: dict, index: dict) -> dict | None:
+        tid = ref.get("trajectory_id")
+        if isinstance(tid, str) and tid in index:
+            return index[tid]
+        tpath = ref.get("trajectory_path")
+        if isinstance(tpath, str) and tpath and base_dir is not None:
+            doc = _read_json_doc(base_dir / tpath)
+            if doc is not None and isinstance(doc.get("steps"), list):
+                return doc
+        return None
+
+    def flatten(doc: dict, index: dict, agent: str | None) -> None:
+        for step in doc.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            source = step.get("source")
+            message = _atif_content_text(step.get("message")).strip()
+            reasoning = step.get("reasoning_content")
+            thought_bits: list[str] = []
+            if isinstance(reasoning, str) and reasoning.strip():
+                thought_bits.append(reasoning.strip())
+            if message:
+                thought_bits.append(message if source == "agent" else f"[{source}] {message}")
+            results: dict = {}
+            for item in (step.get("observation") or {}).get("results") or []:
+                if isinstance(item, dict):
+                    results[item.get("source_call_id")] = item
+            calls: list[dict] = []
+            refs: list[dict] = []
+            for tc in step.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                res = results.get(tc.get("tool_call_id")) or {}
+                calls.append({
+                    "name": str(tc.get("function_name") or "tool"),
+                    "args": tc.get("arguments") if isinstance(tc.get("arguments"), dict) else {},
+                    "observation": _atif_content_text(res.get("content")),
+                    "is_error": None,
+                })
+                for ref in res.get("subagent_trajectory_ref") or []:
+                    if isinstance(ref, dict):
+                        refs.append(ref)
+            emit("\n\n".join(thought_bits), calls, agent)
+            # Inline any subagents this step delegated to (MAS).
+            for ref in refs:
+                sub = resolve_ref(ref, index)
+                tid = ref.get("trajectory_id") or ref.get("trajectory_path") or "?"
+                label = (sub.get("agent") or {}).get("name") if isinstance(sub, dict) else None
+                # Boundary markers belong to the delegating (parent) agent.
+                emit(f"▼ subagent → {label or tid} ({tid})", [], agent)
+                if sub is not None:
+                    sub_agent = (sub.get("agent") or {}).get("name") or label or str(tid)
+                    flatten(sub, subindex(sub), sub_agent)
+                    emit(f"▲ end subagent {label or tid}", [], agent)
+                else:
+                    emit(f"(subagent {tid} could not be resolved)", [], agent)
+
+    root_agent = (root_doc.get("agent") or {}).get("name") if isinstance(root_doc.get("agent"), dict) else None
+    flatten(root_doc, subindex(root_doc), root_agent)
+    if not records:
+        emit("No steps recorded in this ATIF trajectory.", [], root_agent)
+    return records
+
+
+def _atif_state(doc: dict, instance_id: str) -> dict:
+    agent = doc.get("agent") if isinstance(doc.get("agent"), dict) else {}
+    return {
+        "title": instance_id,
+        "custom": {
+            "sourceFramework": "Claude Code",
+            "model": str(agent.get("model_name") or "") or None,
+            "atif": str(doc.get("schema_version") or ""),
+        },
+    }
+
+
 def detect_agent_type(source: Path) -> str:
     """Infer the trajectory format represented by *source*."""
     if source.is_file():
@@ -428,6 +608,8 @@ def detect_agent_type(source: Path) -> str:
             return "codex"
         if _is_claude_code_wire_file(source):
             return "claude"
+        if _is_atif_file(source):
+            return "atif"
         if source.suffix.lower() == ".jsonl":
             return "oh"
         return "sa"
@@ -437,6 +619,8 @@ def detect_agent_type(source: Path) -> str:
     for jsonl_path in source.rglob("*.jsonl"):
         if _is_codex_rollout_file(jsonl_path):
             return "codex"
+    if _atif_files(source):
+        return "atif"
     if any(source.rglob("*.traj.json")):
         return "msa"
     return "sa"
@@ -559,6 +743,28 @@ def scan_trajectories(graphs_dir: Path,
             mark_processed(total)
 
         _CLAUDE_SESSION_INDEXES[graphs_dir] = session_index
+        finish_progress(total)
+        return results
+
+    if agent_type == "atif":
+        atif_paths = _atif_files(graphs_dir)
+        total = len(atif_paths)
+        for path in atif_paths:
+            doc = _read_json_doc(path)
+            if doc is None:
+                mark_processed(total)
+                continue
+            instance_id = _atif_instance_id(path, doc)
+            agent = doc.get("agent") if isinstance(doc.get("agent"), dict) else {}
+            results.append({
+                "instance_id": instance_id,
+                "display_name": instance_id,
+                "status": "none",
+                "difficulty": "unknown",
+                "step_count": len(doc.get("steps") or []),
+                "model": str(agent.get("model_name") or ""),
+            })
+            mark_processed(total)
         finish_progress(total)
         return results
 
@@ -785,6 +991,21 @@ def load_trajectory(graphs_dir: Path, instance_id: str,
             }
         raise FileNotFoundError(
             f"No Claude Code session '{instance_id}' found under {graphs_dir}"
+        )
+
+    if agent_type == "atif":
+        for path in _atif_files(graphs_dir):
+            doc = _read_json_doc(path)
+            if doc is None or _atif_instance_id(path, doc) != instance_id:
+                continue
+            return {
+                "trajectory_format": CLAUDE_CODE_TRAJECTORY_FORMAT,
+                "source_path": str(path),
+                "state": _atif_state(doc, instance_id),
+                "records": _atif_to_wire_records(doc, base_dir=path.parent),
+            }
+        raise FileNotFoundError(
+            f"No ATIF trajectory '{instance_id}' found under {graphs_dir}"
         )
 
     if agent_type == "oh":
@@ -2110,6 +2331,7 @@ def iter_claude_steps(traj_data: dict) -> list[dict]:
             step = {
                 "source_step": event.get("step"),
                 "uuid": str(event.get("uuid") or len(ordered_steps)),
+                "agent": event.get("agent"),
                 "thought_parts": [],
                 "calls": [],
             }
@@ -2238,6 +2460,7 @@ def _build_graph_claude(traj_data: dict, instance_id: str,
     for step_idx, step in enumerate(iter_claude_steps(traj_data)):
         thought = step.get("thought", "") or ""
         calls = step.get("calls", [])
+        step_agent = step.get("agent")
         thought_len_raw = compute_thought_length_raw(thought)
         thought_len_clean = compute_thought_length_clean(thought)
 
@@ -2323,7 +2546,7 @@ def _build_graph_claude(traj_data: dict, instance_id: str,
             node_key = builder.add_or_update_node(
                 node_label="think", args=think_args, flags={}, phase="general",
                 step_idx=step_idx, tool=None, command=None, subcommand=None,
-                thought_length=thought_len_raw, has_cd=False,
+                thought_length=thought_len_raw, has_cd=False, agent=step_agent,
             )
             builder.G.nodes[node_key]["thought_len_raw"] = thought_len_raw
             builder.G.nodes[node_key]["thought_len_clean"] = thought_len_clean
@@ -2388,7 +2611,7 @@ def _build_graph_claude(traj_data: dict, instance_id: str,
                 node_label=node_label, args=args, flags=flags, phase=phase,
                 step_idx=step_idx, tool=tool, command=command,
                 subcommand=subcommand, thought_length=thought_len_raw,
-                has_cd=entry["has_cd"],
+                has_cd=entry["has_cd"], agent=step_agent,
             )
             builder.G.nodes[node_key]["thought_len_raw"] = thought_len_raw
             builder.G.nodes[node_key]["thought_len_clean"] = thought_len_clean
@@ -2981,7 +3204,9 @@ def build_graph(traj_data: dict, instance_id: str,
         return _build_graph_codex(traj_data, instance_id, eval_report_path,
                                   cmd_parser, filter_cd, unique_think=unique_think)
 
-    if agent_type == "claude":
+    if agent_type in ("claude", "atif"):
+        # ATIF is read into Claude Code wire records (see load_trajectory), so it
+        # reuses the same builder; MAS subagents are already flattened inline.
         return _build_graph_claude(
             traj_data, instance_id, eval_report_path, cmd_parser, filter_cd,
             unique_think=unique_think,

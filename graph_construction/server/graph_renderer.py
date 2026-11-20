@@ -240,6 +240,7 @@ def _prepare_nodes(G: nx.MultiDiGraph) -> list[dict[str, Any]]:
             "subcommand":         data.get("subcommand", ""),
             "step_indices":       list(data.get("step_indices", []) or []),
             "step_data":          _sanitize_step_data(data.get("step_data", [])),
+            "agent":              data.get("agent") or None,
         })
     return nodes
 

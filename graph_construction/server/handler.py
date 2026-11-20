@@ -334,6 +334,9 @@ class GraphHandler(BaseHTTPRequestHandler):
                 except OSError:
                     return 0
             return 1
+        if agent_type == "atif":
+            from server.graph_builder import _atif_files
+            return len(_atif_files(trajs))
         if agent_type == "claude":
             # A Claude Code dataset may contain auxiliary JSONL files beside
             # each transcript. Count only the files the scanner will expose.

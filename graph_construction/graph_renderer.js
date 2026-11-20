@@ -20,6 +20,36 @@ let subgraphSegments = [];
 let activeSubgraphIndex = -1;
 let subgraphsPrepared = false;
 
+// ==================== Per-agent views (multi-agent trajectories) ====================
+// agentView: null = single-agent (behave exactly as before); 'all' = one graph with
+// every agent drawn inside its own cluster box; otherwise the name of the single
+// agent whose subgraph is shown in isolation.
+let agentView = null;
+let agentClusterBoxes = [];
+const AGENT_PALETTE = [
+    '#9AB8E0', '#E9B7C4', '#A7D8B4', '#E8D59A',
+    '#C9B8E0', '#E0B89A', '#9AD4E0', '#D7E09A',
+];
+
+function distinctAgents() {
+    const seen = [];
+    (nodesData || []).forEach(node => {
+        const a = node && node.agent;
+        if (a && seen.indexOf(a) === -1) seen.push(a);
+    });
+    return seen;
+}
+
+function hasMultipleAgents() {
+    return distinctAgents().length > 1;
+}
+
+function agentColor(agent) {
+    const list = distinctAgents();
+    const idx = list.indexOf(agent);
+    return AGENT_PALETTE[(idx < 0 ? 0 : idx) % AGENT_PALETTE.length];
+}
+
 function activeNodes() {
     return activeNodesData || nodesData;
 }
@@ -254,6 +284,27 @@ function updateSubgraphPicker() {
     const select = document.getElementById('subgraphSelect');
     if (!picker || !select) return;
 
+    // Multi-agent trajectories drive the picker with per-agent views instead of
+    // the large-graph segments.
+    if (hasMultipleAgents()) {
+        picker.hidden = false;
+        select.replaceChildren();
+        const agents = distinctAgents();
+        const allOption = document.createElement('option');
+        allOption.value = 'agents-all';
+        allOption.textContent = `All agents (${agents.length}) — clustered`;
+        select.appendChild(allOption);
+        agents.forEach(agent => {
+            const count = (nodesData || []).filter(node => node.agent === agent).length;
+            const option = document.createElement('option');
+            option.value = 'agent:' + agent;
+            option.textContent = `${agent} (${count} nodes)`;
+            select.appendChild(option);
+        });
+        select.value = (agentView && agentView !== 'all') ? 'agent:' + agentView : 'agents-all';
+        return;
+    }
+
     const segmented = nodesData.length > SUBGRAPH_NODE_THRESHOLD;
     picker.hidden = !segmented;
     if (!segmented) return;
@@ -298,10 +349,47 @@ function setActiveSubgraph(index, rerender = true) {
     }
 }
 
+function setAgentView(view, rerender = true) {
+    agentView = view;
+    activeSubgraphIndex = -1;  // agent views supersede large-graph segmentation
+    if (view === 'all') {
+        activeNodesData = buildNodeOrder();
+        activeEdgesData = edgesData.map(edge => ({ ...edge }));
+    } else {
+        const keep = new Set(
+            (nodesData || []).filter(node => node.agent === view).map(node => node.id)
+        );
+        activeNodesData = buildNodeOrder().filter(node => keep.has(node.id));
+        activeEdgesData = edgesData
+            .filter(edge => keep.has(edge.from) && keep.has(edge.to))
+            .map(edge => ({ ...edge }));
+    }
+    updateSubgraphPicker();
+    if (rerender && graphEl) {
+        closeSidebar();
+        renderActiveSubgraph();
+    }
+}
+
+// Single entry point for the view <select>: routes between per-agent views and
+// the original large-graph segment views.
+function onViewChange(value) {
+    if (value === 'agents-all') { setAgentView('all'); return; }
+    if (typeof value === 'string' && value.indexOf('agent:') === 0) {
+        setAgentView(value.slice('agent:'.length));
+        return;
+    }
+    setActiveSubgraph(value);
+}
+
 function prepareSubgraphs() {
     if (subgraphsPrepared) return;
     subgraphSegments = buildSubgraphSegments();
-    setActiveSubgraph(nodesData.length < 200 ? 'full' : 0, false);
+    if (hasMultipleAgents()) {
+        setAgentView('all', false);
+    } else {
+        setActiveSubgraph(nodesData.length < 200 ? 'full' : 0, false);
+    }
     subgraphsPrepared = true;
 }
 
@@ -679,6 +767,11 @@ function layoutGraph() {
     // Collapse consecutive same-endpoint execution edges before layout.
     const displayEdges = displayEdgesWithRepeatedFilter(activeEdges());
 
+    // Agent clusters are recomputed on every layout; only the clustered
+    // "all agents" view produces boxes.
+    agentClusterBoxes = [];
+    const clusterMode = (agentView === 'all') && hasMultipleAgents();
+
     // Large cyclic multigraphs are the expensive case for Dagre. They use a
     // compact graph adapter and deterministic placement without waiting for
     // the optional Dagre dependency.
@@ -691,7 +784,7 @@ function layoutGraph() {
         throw new Error('Dagre failed to load for this graph.');
     }
 
-    const g = new dagre.graphlib.Graph({ multigraph: true });
+    const g = new dagre.graphlib.Graph({ multigraph: true, compound: clusterMode });
     g.setGraph({
         rankdir: 'LR',
         ranksep: 120,
@@ -701,17 +794,27 @@ function layoutGraph() {
         marginy: 40
     });
     g.setDefaultEdgeLabel(() => ({}));
-    
+
+    const clusterIds = new Set();
     // Keep each label inside its node so every graph has a consistent visual grammar.
     activeNodes().forEach(node => {
         const label = node.label || node.id;
         node.displayLabel = label;  // Store for rendering
-        
+
         const lines = label.split('\\n');
         const { width, height } = containedNodeSize(lines);
         g.setNode(node.id, { width, height, ...node });
+
+        if (clusterMode && node.agent) {
+            const cid = 'cluster:' + node.agent;
+            if (!clusterIds.has(cid)) {
+                g.setNode(cid, { label: node.agent, clusterLabelPos: 'top' });
+                clusterIds.add(cid);
+            }
+            g.setParent(node.id, cid);
+        }
     });
-    
+
     displayEdges.forEach((edge, idx) => {
         g.setEdge(edge.from, edge.to, edge, `edge-${idx}`);
     });
@@ -763,9 +866,27 @@ function layoutGraph() {
         }
     });
     
+    // Capture per-agent cluster boxes (positions already offset-normalized).
+    if (clusterMode) {
+        clusterIds.forEach(cid => {
+            const c = g.node(cid);
+            if (c && Number.isFinite(c.x) && Number.isFinite(c.width)) {
+                const agent = cid.slice('cluster:'.length);
+                agentClusterBoxes.push({
+                    agent,
+                    x: c.x - c.width / 2,
+                    y: c.y - c.height / 2,
+                    width: c.width,
+                    height: c.height,
+                    color: agentColor(agent),
+                });
+            }
+        });
+    }
+
     const graphWidth = maxX - minX;
     const graphHeight = maxY - minY;
-    
+
     return { g, graphWidth, graphHeight };
 }
 
@@ -1290,7 +1411,10 @@ function addBoundaryBadge(nodeGroup, node, label) {
 function renderNodes(svg, g, defs) {
     const nodeFragment = document.createDocumentFragment();
     g.nodes().forEach(nodeId => {
+        // Compound-layout cluster nodes are drawn separately as agent boxes.
+        if (typeof nodeId === 'string' && nodeId.indexOf('cluster:') === 0) return;
         const node      = g.node(nodeId);
+        if (!node) return;
         const nodeGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
         nodeGroup.setAttribute('class',        'node');
         nodeGroup.setAttribute('data-id',      nodeId);
@@ -2182,6 +2306,38 @@ function setupSidebarResize() {
 
 // ==================== Initialization ====================
 
+// Draw one labelled box per agent behind the edges and nodes (clustered view).
+function renderAgentClusters(svg) {
+    if (!agentClusterBoxes.length) return;
+    const ns = 'http://www.w3.org/2000/svg';
+    const layer = document.createElementNS(ns, 'g');
+    layer.setAttribute('class', 'agent-clusters');
+    agentClusterBoxes.forEach(box => {
+        const rect = document.createElementNS(ns, 'rect');
+        rect.setAttribute('x', box.x);
+        rect.setAttribute('y', box.y);
+        rect.setAttribute('width', box.width);
+        rect.setAttribute('height', box.height);
+        rect.setAttribute('rx', 14);
+        rect.setAttribute('ry', 14);
+        rect.setAttribute('fill', box.color + '22');       // ~13% alpha tint
+        rect.setAttribute('stroke', box.color);
+        rect.setAttribute('stroke-width', '2');
+        rect.setAttribute('stroke-dasharray', '7 5');
+        rect.setAttribute('class', 'agent-cluster-box');
+        layer.appendChild(rect);
+
+        const label = document.createElementNS(ns, 'text');
+        label.setAttribute('x', box.x + 14);
+        label.setAttribute('y', box.y + 22);
+        label.setAttribute('class', 'agent-cluster-label');
+        label.setAttribute('fill', box.color);
+        label.textContent = box.agent;
+        layer.appendChild(label);
+    });
+    svg.appendChild(layer);
+}
+
 function renderActiveSubgraph() {
     if (!graphEl) return;
 
@@ -2192,6 +2348,7 @@ function renderActiveSubgraph() {
 
     const nextSvg = createSVG(graphWidth, graphHeight);
     const defs = createMarkers(nextSvg);
+    renderAgentClusters(nextSvg);
     renderEdges(nextSvg, g, defs);
     renderNodes(nextSvg, g, defs);
 

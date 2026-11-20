@@ -200,6 +200,18 @@ svg {
     pointer-events: none;
 }
 
+/* Per-agent cluster boxes (multi-agent "All agents" view) */
+.agent-cluster-box {
+    pointer-events: none;
+}
+.agent-cluster-label {
+    pointer-events: none;
+    font-family: "DejaVu Sans", Arial, sans-serif;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: .03em;
+}
+
 .edge path {
     fill: none;
     /* stroke and stroke-width are set entirely by JS — no CSS override here */
